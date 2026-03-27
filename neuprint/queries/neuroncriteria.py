@@ -16,23 +16,62 @@ from ..client import inject_client
 
 NoneType = type(None)
 
-
 def neuroncriteria_args(*argnames):
     """
     Returns a decorator.
     For the given argument names, the decorator converts the
     arguments into NeuronCriteria objects via ``copy_as_neuroncriteria()``.
 
-    If the decorated function also accepts a 'client' argument,
-    that argument is used to initialize the NeuronCriteria.
+    If provided, the 'client' keyword argument to the decorated function
+    must be the same as the 'client' attribute in all of the passed NeuronCriteria arguments.
+    If any client is None (either the keyword argument or the NeuronCriteria client(s)),
+    then it will be automatically set from the valid clients that were provided.
+
+    Example:
+
+    .. code-block:: python
+
+        @neuroncriteria_args('nc'):
+        def foo(nc, client=None):
+            pass
+
+        # All of the following are equivalent:
+        foo(NC(client=c), client=c)
+        foo(NC(client=c))  
+        foo(NC(), client=c)
+
+        # Invalid:
+        c1 = Client('neuprint.janelia.org', 'hemibrain:v1.0')
+        c2 = Client('neuprint.janelia.org', 'hemibrain:v1.1')
+        foo(NC(client=c1), client=c2)  # raises ValueError
     """
     def decorator(f):
 
         @functools.wraps(f)
         def wrapper(*args, **kwargs):
             callargs = inspect.getcallargs(f, *args, **kwargs)
+
+            clients = set()
+            if c := callargs.get('client', None):
+                clients.add(c)
             for name in argnames:
-                callargs[name] = copy_as_neuroncriteria(callargs[name], callargs.get('client', None))
+                arg = callargs[name]
+                if isinstance(arg, NeuronCriteria) and arg.client:
+                    clients.add(arg.client)
+
+            if len(clients) == 1:
+                client = clients.pop()
+            elif len(clients) > 1:
+                raise ValueError(f"Clients of NeuronCriteria arguments and/or the keyword argument do not match: {clients}")
+            else:
+                client = None
+
+            for name in argnames:
+                callargs[name] = copy_as_neuroncriteria(callargs[name], client)
+
+            if 'client' in callargs:
+                callargs['client'] = client
+
             return f(**callargs)
 
         wrapper.__signature__ = inspect.signature(f)
@@ -43,7 +82,9 @@ def neuroncriteria_args(*argnames):
 
 def copy_as_neuroncriteria(obj, client=None):
     """
-    If the given argument is a NeuronCriteria object, copy it.
+    If the given argument is a NeuronCriteria object, copy it
+    and overwrite the copy's 'client' attribute if one was provided.
+
     Otherwise, attempt to construct a NeuronCriteria object,
     using the argument as either the bodyId or the type AND instance.
 
@@ -74,7 +115,10 @@ def copy_as_neuroncriteria(obj, client=None):
         return NeuronCriteria(client=client)
 
     if isinstance(obj, NeuronCriteria):
-        return copy.copy(obj)
+        nc = copy.copy(obj)
+        if client:
+            nc.client = client
+        return nc
 
     if not isinstance(obj, Collection) or isinstance(obj, str):
         if isinstance(obj, str):
@@ -121,22 +165,35 @@ _iterable_attrs = [
     # special: roi_req, min_roi_inputs, min_roi_outputs
 
     # integer
-    'group', 'serial',
+    'group', 'serial', 'zapbenchId',
 
     # boolean
     # 'cropped',
 
+    # Secondary type fields (regex-optional)
+    'flywireType', 'hemibrainType', 'mancType',
+
     # Exact string fields (alphabetical order)
-    'birthtime', 'cellBodyFiber', 'class_',
-    'entryNerve', 'exitNerve', 'hemilineage',
-    'longTract', 'modality', 'origin',
-    'predictedNt', 'serialMotif', 'somaNeuromere',
-    'somaSide', 'status', 'statusLabel',
-    'subclass', 'synonyms', 'systematicType',
-    'target',
+    # these fields come from several datasets; this list appears elsewhere
+    #   in the code, always with "exact string fields" in a nearby comment
+    # TODO: (a) generate this list dynamically from the db, and
+    #       (b) consider making them all eligible for regex searching
+    'birthtime', 'cellBodyFiber', 'celltypePredictedNt',
+    'class_', 'consensusNt', 'description',
+    'dimorphism', 'entryNerve', 'exitNerve', 'flywireId',
+    'fruDsx', 'hemibrainBodyId',
+    'hemilineage', 'itoleeHl', 'locationType', 'longTract',
+    'matchingNotes', 'mcnsSerial', 'modality',
+    'ntReference', 'origin', 'otherNt', 'otherNtReference',
+    'predictedNt', 'prefix', 'receptorType', 'rootSide',
+    'serialMotif', 'somaNeuromere', 'somaSide', 'source',
+    'status', 'statusLabel', 'subclass', 'subclassabbr',
+    'superclass', 'supertype', 'synonyms', 'systematicType',
+    'tag', 'target', 'transmission', 'trumanHl',
+    'vfbId',
 
     # Special
-    # label, min_pre, min_post
+    # label, min_pre, min_post, max_closestLandmarkDistanceMicrons
 
     # Null/NotNull
     # somaLocation, tosomaLocation,
@@ -174,7 +231,6 @@ class NeuronCriteria:
             neuron_df, conn_df = fetch_neurons("OA-VPM3")
     """
 
-    @inject_client
     @ensure_list_args(_iterable_attrs)
     def __init__(
         self, matchvar='n', *,
@@ -192,21 +248,32 @@ class NeuronCriteria:
         roi_req='all', min_roi_inputs=1, min_roi_outputs=1,
 
         # integer
-        group=None, serial=None,
+        group=None, serial=None, zapbenchId=None,
 
         # boolean
         cropped=None,
 
+        # Secondary type fields (regex-optional)
+        flywireType=None, hemibrainType=None, mancType=None,
+
         # Other exact string fields (alphabetical)
-        birthtime=None, cellBodyFiber=None, class_=None,
-        entryNerve=None, exitNerve=None, hemilineage=None,
-        longTract=None, modality=None, origin=None,
-        predictedNt=None, serialMotif=None, somaNeuromere=None,
-        somaSide=None, subclass=None, synonyms=None,
-        systematicType=None, target=None,
+        birthtime=None, cellBodyFiber=None, celltypePredictedNt=None,
+        class_=None, consensusNt=None, description=None,
+        dimorphism=None, entryNerve=None, exitNerve=None, flywireId=None,
+        fruDsx=None, hemibrainBodyId=None,
+        hemilineage=None, itoleeHl=None, locationType=None, longTract=None,
+        matchingNotes=None, mcnsSerial=None, modality=None,
+        ntReference=None, origin=None, otherNt=None, otherNtReference=None,
+        predictedNt=None, prefix=None, receptorType=None, rootSide=None,
+        serialMotif=None, somaNeuromere=None, somaSide=None, source=None,
+        subclass=None, subclassabbr=None,
+        superclass=None, supertype=None, synonyms=None, systematicType=None,
+        tag=None, target=None, transmission=None, trumanHl=None,
+        vfbId=None,
+
 
         # Special
-        label=None, min_pre=0, min_post=0,
+        label=None, min_pre=0, min_post=0, max_closestLandmarkDistanceMicrons=np.inf,
 
         # IsNull/NotNull
         somaLocation=None, tosomaLocation=None, rootLocation=None,
@@ -275,8 +342,8 @@ class NeuronCriteria:
                 matches EITHER criteria will match the overall criteria.
 
             regex (bool):
-                If ``True``, the ``instance`` and ``type`` arguments will be interpreted as
-                regular expressions, rather than exact match strings.
+                If ``True``, the ``instance`` and all ``type``-style arguments will be interpreted
+                as regular expressions, rather than exact match strings.
                 If ``False``, only exact matches will be found.
                 By default, the matching method will be automatically chosen by inspecting the
                 ``type`` and ``instance`` strings.  If they contain regex-like characters,
@@ -330,24 +397,54 @@ class NeuronCriteria:
                 If given, restrict results to neurons that are cropped or not.
 
             birthtime (str or list of str):
+
             cellBodyFiber (str or list of str):
+
+            superclass (str or list of str):
+
             class\\_ (str or list of str):
                 Matches for the neuron ``class`` field.
+
             entryNerve (str or list of str):
+
             exitNerve (str or list of str):
+
+            flywireType (str or list of str, regex-optional):
+
+            hemibrainType (str or list of str, regex-optional):
+
             hemilineage (str or list of str):
+
+            itoleeHl (str or list of str):
+
             longTract (str or list of str):
+
+            mancType (str or list of str, regex-optional):
+
             modality (str or list of str):
+
             origin (str or list of str):
+
             predictedNt (str or list of str):
+
             serialMotif (str or list of str):
+
             somaNeuromere (str or list of str):
+
             somaSide  (str or list of str):
                 Valid choices are 'RHS', 'LHS', 'Midline'
+
             subclass (str or list of str):
+
             synonyms (str or list of str):
+
             systematicType (str or list of str):
+
             target (str or list of str):
+
+            trumanHl (str or list of str):
+
+            zapbenchId:
 
             label (Either ``'Neuron'`` or ``'Segment'``):
                 Which node label to match with.
@@ -387,17 +484,27 @@ class NeuronCriteria:
             soma (Either ``True``, ``False``, or ``None``)
                 DEPRECATED.  Use ``somaLocation=NotNull`` or ``somaLocation=IsNull``.
 
+            zapbenchId (int or list of int):
+                (zebrafish only) This field is used to identify neurons that have been matched to neurons
+                in the ZAPBench dataset.
+
+            max_closestLandmarkDistanceMicrons (float):
+                (zebrafish only) The maximum distance (in microns) from the closest landmark
+                that a neuron must have to be included in the results.
+
             client (:py:class:`neuprint.client.Client`):
                 Used to validate ROI names.
-                If not provided, the global default ``Client`` will be used.
         """
+        # Note: client may be None upon construction, but typically
+        # the @neuroncriteria_args decorator will set it automatically.
+        self.client = client
+
         self.matchvar = self._init_matchvar(matchvar)
         self.bodyId = self._init_integer_arg(bodyId, 'bodyId')
 
         # regex-optional
         self.type = self._init_type(type)
         self.instance = self._init_instance(instance)
-        self.regex = self._init_regex(regex, type, instance)
 
         # Status (exact string)
         self.status = status
@@ -408,13 +515,14 @@ class NeuronCriteria:
          self.rois, self.inputRois, self.outputRois) = (
             self._init_rois(
                 roi_req, min_roi_inputs, min_roi_outputs,
-                rois, inputRois, outputRois, client
+                rois, inputRois, outputRois
             )
         )
 
         # integer
         self.group = self._init_integer_arg(group, 'group')
         self.serial = self._init_integer_arg(serial, 'serial')
+        self.zapbenchId = self._init_integer_arg(zapbenchId, 'zapbenchId')
 
         # boolean
         self.cropped = cropped
@@ -424,29 +532,60 @@ class NeuronCriteria:
         self.tosomaLocation = self._init_location_arg(tosomaLocation, 'tosomaLocation')
         self.rootLocation = self._init_location_arg(rootLocation, 'rootLocation')
 
+        # Alternative type fields (alphabetical)
+        self.flywireType = flywireType
+        self.hemibrainType = hemibrainType
+        self.mancType = mancType
+
         # Other exact string fields (alphabetical order)
         self.birthtime = birthtime
         self.cellBodyFiber = cellBodyFiber
+        self.celltypePredictedNt = celltypePredictedNt
         self.class_ = class_
+        self.consensusNt = consensusNt
+        self.description = description
+        self.dimorphism = dimorphism
         self.entryNerve = entryNerve
         self.exitNerve = exitNerve
+        self.flywireId = flywireId
+        self.fruDsx = fruDsx
+        self.hemibrainBodyId = hemibrainBodyId
         self.hemilineage = hemilineage
+        self.itoleeHl = itoleeHl
+        self.locationType = locationType
         self.longTract = longTract
+        self.matchingNotes = matchingNotes
+        self.mcnsSerial = mcnsSerial
         self.modality = modality
+        self.ntReference = ntReference
         self.origin = origin
+        self.otherNt = otherNt
+        self.otherNtReference = otherNtReference
         self.predictedNt = predictedNt
+        self.prefix = prefix
+        self.receptorType = receptorType
+        self.rootSide = rootSide
         self.serialMotif = serialMotif
         self.somaNeuromere = somaNeuromere
         self.somaSide = somaSide
+        self.source = source
         self.subclass = subclass
+        self.subclassabbr = subclassabbr
+        self.superclass = superclass
+        self.supertype = supertype
         self.synonyms = synonyms
         self.systematicType = systematicType
+        self.tag = tag
         self.target = target
+        self.transmission = transmission
+        self.trumanHl = trumanHl
+        self.vfbId = vfbId
 
         # Special
         self.label = self._init_label(label, bodyId)
         self.min_pre = min_pre
         self.min_post = min_post
+        self.max_closestLandmarkDistanceMicrons = max_closestLandmarkDistanceMicrons
 
         # Deprecated
         self.soma = self._init_soma(soma, somaLocation)
@@ -458,20 +597,29 @@ class NeuronCriteria:
             'bodyId',
 
             # integer
-            'group', 'serial',
+            'group', 'serial', 'zapbenchId',
 
             # status (exact string)
             'status', 'statusLabel',
 
             # Other exact string fields (alphabetical order)
-            'birthtime', 'cellBodyFiber', 'class_',
-            'entryNerve', 'exitNerve', 'hemilineage',
-            'longTract', 'modality', 'origin',
-            'predictedNt', 'serialMotif', 'somaNeuromere',
-            'somaSide', 'subclass', 'synonyms',
-            'systematicType', 'target',
+            'birthtime', 'cellBodyFiber', 'celltypePredictedNt',
+            'class_', 'consensusNt', 'description',
+            'dimorphism', 'entryNerve', 'exitNerve', 'flywireId',
+            'flywireType', 'fruDsx', 'hemibrainBodyId', 'hemibrainType',
+            'hemilineage', 'itoleeHl', 'locationType', 'longTract',
+            'mancType', 'matchingNotes', 'mcnsSerial', 'modality',
+            'ntReference', 'origin', 'otherNt', 'otherNtReference',
+            'predictedNt', 'prefix', 'receptorType', 'rootSide',
+            'serialMotif', 'somaNeuromere', 'somaSide', 'source',
+            'subclass', 'subclassabbr',
+            'superclass', 'supertype', 'synonyms', 'systematicType',
+            'tag', 'target', 'transmission', 'trumanHl',
+            'vfbId',
+
         ]
-        self.list_props_regex = ['type', 'instance']
+        self.list_props_regex = ['type', 'instance', 'flywireType', 'hemibrainType', 'mancType']
+        self.regex = self._init_regex(regex, *[getattr(self, prop) for prop in self.list_props_regex])
 
     @classmethod
     def _init_matchvar(cls, matchvar):
@@ -528,25 +676,21 @@ class NeuronCriteria:
         return instance
 
     @classmethod
-    def _init_regex(cls, regex, type, instance):
+    def _init_regex(cls, regex, *args):
         assert regex in (True, False, 'guess')
         if regex != 'guess':
             return regex
 
         rgx = re.compile(r'[\\\.\?\[\]\+\^\$\*]')
-        instance_is_regex = False
-        for i in instance:
-            instance_is_regex |= isinstance(i, str) and bool(rgx.search(i or ''))
+        for arg in args:
+            for val in arg:
+                if isinstance(val, str) and bool(rgx.search(val or '')):
+                    return True
 
-        type_is_regex = False
-        for t in type:
-            type_is_regex |= isinstance(t, str) and bool(rgx.search(t or ''))
-
-        regex = type_is_regex or instance_is_regex
-        return regex
+        return False
 
     @classmethod
-    def _init_rois(cls, roi_req, min_roi_inputs, min_roi_outputs, rois, inputRois, outputRois, client):
+    def _init_rois(cls, roi_req, min_roi_inputs, min_roi_outputs, rois, inputRois, outputRois):
         assert roi_req in ('any', 'all')
         assert min_roi_inputs <= 1 or inputRois, \
             "Can't stipulate min_roi_inputs without a list of inputRois"
@@ -564,21 +708,30 @@ class NeuronCriteria:
         # Make sure intersecting is a superset of inputRois and outputRois
         rois |= {*inputRois, *outputRois}
 
-        # Verify ROI names against known ROIs.
+        return roi_req, min_roi_inputs, min_roi_outputs, rois, inputRois, outputRois
+
+    @inject_client
+    def _validate_rois(self, *, client=None):
+        """
+        Verify ROI names against known ROIs.
+        This requires access to a client from which we obtain the list of valid ROIs.
+        We don't call this function upon construction, since sometimes it's
+        convenient to assign the client after the rest of the initialization.
+        Instead, this function is called when constructing a query.
+        """
+
         neuprint_rois = {*client.all_rois}
-        unknown_input_rois = inputRois - neuprint_rois
+        unknown_input_rois = self.inputRois - neuprint_rois
         if unknown_input_rois:
             raise RuntimeError(f"Unrecognized input ROIs: {unknown_input_rois}")
 
-        unknown_output_rois = outputRois - neuprint_rois
+        unknown_output_rois = self.outputRois - neuprint_rois
         if unknown_output_rois:
             raise RuntimeError(f"Unrecognized output ROIs: {unknown_output_rois}")
 
-        unknown_generic_rois = rois - neuprint_rois
+        unknown_generic_rois = self.rois - neuprint_rois
         if unknown_generic_rois:
-            raise RuntimeError(f"Unrecognized output ROIs: {unknown_generic_rois}")
-
-        return roi_req, min_roi_inputs, min_roi_outputs, rois, inputRois, outputRois
+            raise RuntimeError(f"Unrecognized ROIs: {unknown_generic_rois}")
 
     @classmethod
     def _init_soma(cls, soma, somaLocation):
@@ -612,7 +765,7 @@ class NeuronCriteria:
             other = getattr(value, p)
 
             # If not the same type, return False
-            if type(me) != type(other):
+            if type(me) is not type(other):
                 return False
 
             # If iterable (e.g. ROIs or body IDs) we don't care about order
@@ -637,11 +790,14 @@ class NeuronCriteria:
         for attr in list_props:
             val = getattr(self, attr)
             if len(val) == 1:
-                s += f', {attr}="{val[0]}"'
+                s += f', {attr}={repr(val[0])}'
             elif len(self.instance) > 1:
-                s += f", {attr}={list(val)}"
+                s += f", {attr}={repr(list(val))}"
 
-        if len(self.type) or len(self.instance):
+        if any(
+            len(getattr(self, attr))
+            for attr in self._list_props_regex
+        ):
             s += f", regex={self.regex}"
 
         if self.min_pre != 0:
@@ -649,6 +805,9 @@ class NeuronCriteria:
 
         if self.min_post != 0:
             s += f", min_post={self.min_post}"
+
+        if not np.isposinf(self.max_closestLandmarkDistanceMicrons):
+            s += f", max_closestLandmarkDistanceMicrons={self.max_closestLandmarkDistanceMicrons}"
 
         if self.rois:
             s += f", rois={list(self.rois)}"
@@ -700,7 +859,7 @@ class NeuronCriteria:
                     values = values.tolist()
                 values = [v for v in values if v is not None]
                 var = cypher_identifier(f"{self.matchvar}_search_{key}")
-                exprs[var] = (f"{values} as {var}")
+                exprs[var] = (f"{repr(values)} as {var}")
 
         return exprs
 
@@ -746,6 +905,8 @@ class NeuronCriteria:
             ('soma',): self._single_value_expr('somaLocation', self.soma),  # deprecated arg
             ('min_pre',): self._gt_eq_expr('pre', self.min_pre),
             ('min_post',): self._gt_eq_expr('post', self.min_post),
+            ('max_closestLandmarkDistanceMicrons',): self._lt_eq_expr('closestLandmarkDistanceMicrons',
+                  self.max_closestLandmarkDistanceMicrons),
             ('rois', 'inputRois', 'outputRois', 'roi_req', 'min_roi_inputs', 'min_roi_outputs'): self.rois_expr(),
             # No expression for label;
             # enclosing queries are responsible for inserting label into their MATCH statement.
@@ -784,7 +945,7 @@ class NeuronCriteria:
         if value is None:
             return ""
         if not isinstance(value, bool):
-            return f"{self.matchvar}.{key} = '{value}'"
+            return f"{self.matchvar}.{key} = {repr(value)}"
         elif value:
             return f"{self.matchvar}.{key} IS NOT NULL"
         else:
@@ -838,6 +999,15 @@ class NeuronCriteria:
         else:
             return ""
 
+    def _lt_eq_expr(self, key, value):
+        """
+        Match against key/value being less than or equal.
+        """
+        if not np.isposinf(value):
+            return f"{self.matchvar}.{key} <= {value}"
+        else:
+            return ""
+
     def typeinst_expr(self):
         """
         Unlike all other fields, type and instance OR'd together.
@@ -855,9 +1025,11 @@ class NeuronCriteria:
         return ""
 
     def rois_expr(self):
+        self._validate_rois(client=self.client)
         return self._logic_tag_expr(
             self.rois,
-            {'any': 'OR', 'all': 'AND'}[self.roi_req])
+            {'any': 'OR', 'all': 'AND'}[self.roi_req]
+        )
 
     def all_conditions(self, *vars, prefix=0, comments=True):
         if isinstance(prefix, int):
@@ -996,8 +1168,8 @@ class NeuronCriteria:
         conditions = dedent(f"""\
             // -- Directed ROI conditions for segment '{self.matchvar}' --
             WITH {vars},
-                 {[*self.inputRois]} as inputRois,
-                 {[*self.outputRois]} as outputRois,
+                 {repr([*self.inputRois])} as inputRois,
+                 {repr([*self.outputRois])} as outputRois,
                  apoc.convert.fromJsonMap({self.matchvar}.roiInfo) as roiInfo
 
             // Check input ROIs (segment '{self.matchvar}')
@@ -1115,12 +1287,9 @@ def where_expr(field, values, regex=False, matchvar='n', valuevar=None):
             return f"exists({matchvar}.{field})"
 
         if regex:
-            return f"{matchvar}.{field} =~ '{values[0]}'"
+            return f"{matchvar}.{field} =~ {repr(values[0])}"
 
-        if isinstance(values[0], str):
-            return f"{matchvar}.{field} = '{values[0]}'"
-
-        return f"{matchvar}.{field} = {values[0]}"
+        return f"{matchvar}.{field} = {repr(values[0])}"
 
     if NotNull in values and len(values) > 1:
         raise ValueError('`NotNull` can not be combined with other criteria '
@@ -1134,9 +1303,9 @@ def where_expr(field, values, regex=False, matchvar='n', valuevar=None):
             assert all(isinstance(v, str) for v in values), \
                 "Expected all regex values to be strings"
             r = '|'.join(f'({v})' for v in values)
-            return f"{matchvar}.{field} =~ '{r}'"
+            return f"{matchvar}.{field} =~ {repr(r)}"
         else:
-            return f"{matchvar}.{field} in {values}"
+            return f"{matchvar}.{field} in {repr(values)}"
 
     # ['some_val', None, 'some_other']
     values = [v for v in values if v not in (None, IsNull)]
@@ -1144,11 +1313,9 @@ def where_expr(field, values, regex=False, matchvar='n', valuevar=None):
         if regex:
             assert isinstance(values[0], str), \
                 "Expected all regex values to be strings"
-            return f"{matchvar}.{field} =~ '{values[0]}' OR NOT exists({matchvar}.{field})"
-        elif isinstance(values[0], str):
-            return f"{matchvar}.{field} = '{values[0]}' OR NOT exists({matchvar}.{field})"
+            return f"{matchvar}.{field} =~ {repr(values[0])} OR NOT exists({matchvar}.{field})"
         else:
-            return f"{matchvar}.{field} = {values[0]} OR NOT exists({matchvar}.{field})"
+            return f"{matchvar}.{field} = {repr(values[0])} OR NOT exists({matchvar}.{field})"
     else:
         if regex:
             # Combine the list of regexes into a single regex
@@ -1156,8 +1323,8 @@ def where_expr(field, values, regex=False, matchvar='n', valuevar=None):
             assert all(isinstance(v, str) for v in values), \
                 "Expected all regex values to be strings"
             r = '|'.join(f'({v})' for v in values)
-            return f"{matchvar}.{field} =~ '{r}' OR NOT exists({matchvar}.{field})"
+            return f"{matchvar}.{field} =~ {repr(r)} OR NOT exists({matchvar}.{field})"
         elif valuevar:
             return f"{matchvar}.{field} in {valuevar} OR NOT exists({matchvar}.{field})"
         else:
-            return f"{matchvar}.{field} in {values} OR NOT exists({matchvar}.{field})"
+            return f"{matchvar}.{field} in {repr(values)} OR NOT exists({matchvar}.{field})"

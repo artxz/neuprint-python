@@ -8,10 +8,11 @@ from neuprint import (NeuronCriteria as NC,
                       SynapseCriteria as SC,
                       fetch_custom, fetch_neurons, fetch_meta,
                       fetch_all_rois, fetch_primary_rois, fetch_simple_connections,
-                      fetch_adjacencies, fetch_shortest_paths,
+                      fetch_adjacencies, fetch_shortest_paths, fetch_paths,
                       fetch_mitochondria, fetch_synapses_and_closest_mitochondria,
                       fetch_synapses, fetch_mean_synapses, fetch_synapse_connections)
 
+from neuprint.queries.neurons import CORE_NEURON_COLS
 from neuprint.tests import NEUPRINT_SERVER, DATASET
 
 @pytest.fixture(scope='module')
@@ -79,6 +80,15 @@ def test_fetch_neurons(client):
     neurons, roi_counts = fetch_neurons(NC(min_pre=1000, min_post=2000))
     assert neurons.eval('pre >= 1000 and post >= 2000').all()
 
+    neurons, roi_counts = fetch_neurons(NC(bodyId=bodyId), returned_columns="core")
+    # hemibrain dataset has all the CORE_NEURON_COLS
+    assert set(neurons.columns) == set(CORE_NEURON_COLS)
+
+    requested_columns = ['bodyId', 'instance']
+    neurons = fetch_neurons(NC(bodyId=bodyId), returned_columns=requested_columns, omit_rois=True)
+    assert set(neurons.columns) == set(requested_columns)
+
+
 
 def test_fetch_simple_connections(client):
     bodyId = [294792184, 329566174, 329599710, 417199910, 420274150,
@@ -126,6 +136,33 @@ def test_fetch_shortest_paths(client):
     assert (paths_df.groupby('path')['bodyId'].last() == dst).all()
 
     assert (paths_df.groupby('path')['weight'].first() == 0).all()
+
+def test_fetch_paths_exact(client):
+    src = 329566174
+    dst = 294792184
+    paths_df = fetch_paths(src, dst, path_length=2, min_weight=10, timeout=3)
+    assert (paths_df.groupby('path')['bodyId'].first() == src).all()
+    assert (paths_df.groupby('path')['bodyId'].last() == dst).all()
+
+    assert "path_length" in paths_df.columns
+    assert (paths_df['path_length'] == 2).all()
+
+def test_fetch_paths_limited(client):
+    src = 329566174
+    dst = 294792184
+    paths_df = fetch_paths(src, dst, max_path_length=2, min_weight=10, timeout=3)
+    assert (paths_df.groupby('path')['bodyId'].first() == src).all()
+    assert (paths_df.groupby('path')['bodyId'].last() == dst).all()
+
+    assert "path_length" in paths_df.columns
+    assert (paths_df['path_length'] <= 2).all()
+
+def test_fetch_paths_input(client):
+    src = 329566174
+    dst = 294792184
+    with pytest.raises(ValueError):
+        # path_length and max_path_length are mutually exclusive
+        fetch_paths(src, dst, path_length=2, max_path_length=2, min_weight=10, timeout=3)
 
 
 @pytest.mark.skip
@@ -240,6 +277,24 @@ def test_fetch_synapse_connections(client):
     syn_df = fetch_synapse_connections(879442155, 5813027103)
     assert len(syn_df) == 0
     assert syn_df.dtypes.to_dict() == dtypes
+
+def test_issue_69(client):
+    # Issue #69: somaLocation should be a list independent of omit_rois parameter.
+
+    # This body in hemibrain is known to have a somaLocation.
+    bodyId = 294792184
+    neuron_df, roi_counts_df = fetch_neurons(NC(bodyId=bodyId))
+    assert 'somaLocation' in neuron_df.columns
+    somaLocation = neuron_df.iloc[0]["somaLocation"]
+    assert isinstance(somaLocation, list)
+    assert len(somaLocation) == 3
+
+    # Fetch without ROIs
+    neuron_df = fetch_neurons(NC(bodyId=bodyId), omit_rois=True)
+    assert 'somaLocation' in neuron_df.columns
+    somaLocation = neuron_df.iloc[0]["somaLocation"]
+    assert isinstance(somaLocation, list)
+    assert len(somaLocation) == 3
 
 
 if __name__ == "__main__":

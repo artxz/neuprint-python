@@ -8,6 +8,8 @@ Notes for maintaining ``neuprint-python``.
 Prerequisites
 -------------
 
+**For general development:**
+
 Make sure you have both ``flyem-forge`` and ``conda-forge`` listed as channels in your ``.condarc`` file.
 (If you don't know where your ``.condarc`` file is, check ``conda config --show-sources``.)
 
@@ -18,6 +20,8 @@ Make sure you have both ``flyem-forge`` and ``conda-forge`` listed as channels i
     - flyem-forge
     - conda-forge
     - nodefaults  # A magic channel that forbids any downloads from the anaconda default channels.
+
+**For packaging and release:**
 
 Install ``conda-build`` if you don't have it yet:
 
@@ -33,7 +37,7 @@ Before you can upload packages to PyPI, you'll need to be added as a "collaborat
 ``neuprint-python`` project on PyPI.  Then you'll need to log in and obtain a token with
 an appropriate scope for ``neuprint-python`` and add it to your ``~/.pypirc`` file:
 
-.. code-block:: toml
+.. code-block::
 
     [distutils]
     index-servers =
@@ -86,7 +90,7 @@ To prepare a release, follow these steps:
 
     # Build and upload the conda package
     conda build conda-recipe
-    anaconda upload -u flyem-forge $(conda info --base)/conda-bld/noarch/neuprint-python-${NEW_TAG}-py_0.tar.bz2
+    anaconda upload -u flyem-forge $(conda info --base)/conda-bld/noarch/neuprint-python-${NEW_TAG}-py_0.conda
 
     # Build and upload the PyPI package
     ./upload-to-pypi.sh
@@ -129,7 +133,10 @@ follow these steps **on a Linux machine**:
 Documentation
 -------------
 
-The docs are built with Sphinx.  See ``docs/requirements.txt`` for the docs dependencies.
+The docs are built with Sphinx.  See ``docs/requirements.txt`` for the docs dependencies (in addition to those listed in ``dependencies.txt``). In addition, building the docs requires the ``pandoc`` command-line tool to be installed in the environment (the Python wrapper, though, is not required).
+
+The example notebooks are run when the docs are built. For this to succeed, the ``neuprint`` library must be on your ``PYTHONPATH``. Like the tests, the docs rely on the public ``hemibrain:v1.2.1`` dataset on ``neuprint.janelia.org``, which means you must define ``NEUPRINT_APPLICATION_CREDENTIALS`` in your environment before running them.
+
 To build the docs locally:
 
 .. code-block:: bash

@@ -1,7 +1,9 @@
+from collections.abc import Iterable
+from textwrap import indent
+
 import pandas as pd
 import ujson
 
-from textwrap import indent
 from ..client import inject_client
 from ..utils import compile_columns, cypher_identifier
 from .neuroncriteria import neuroncriteria_args
@@ -17,7 +19,7 @@ CORE_NEURON_COLS = ['bodyId', 'instance', 'type',
 
 @inject_client
 @neuroncriteria_args('criteria')
-def fetch_neurons(criteria=None, *, client=None):
+def fetch_neurons(criteria=None, *, omit_rois=False, returned_columns="all", client=None):
     """
     Return properties and per-ROI synapse counts for a set of neurons.
 
@@ -36,12 +38,23 @@ def fetch_neurons(criteria=None, *, client=None):
             Only Neurons which satisfy all components of the given criteria are returned.
             If no criteria is specified then the default ``NeuronCriteria()`` is used.
 
+        omit_rois (bool):
+            If True, the ROI columns are omitted from the output.
+            If you don't need ROI information, this can speed up the query.
+
+        returned_columns:
+            If 'all', all available columns are returned.
+            If 'core', only the core set of columns (see :py:const:`CORE_NEURON_COLS`) are returned.
+            If a list, only the specified columns are returned, in the order given.
+
+            In all cases, invalid column names are ignored.
+
         client:
             If not provided, the global default :py:class:`.Client` will be used.
 
     Returns:
-        Two DataFrames.
-        ``(neurons_df, roi_counts_df)``
+        Two DataFrames: ``(neurons_df, roi_counts_df)`` unless ``omit_rois`` is True,
+        in which case only ``neurons_df`` is returned.
 
         In ``neurons_df``, all available ``:Neuron`` columns are returned, with the following changes:
 
@@ -117,8 +130,30 @@ def fetch_neurons(criteria=None, *, client=None):
     # Unlike in fetch_custom_neurons() below, here we specify the
     # return properties individually to avoid a large JSON payload.
     # (Returning a map on every row is ~2x more costly than returning a table of rows/columns.)
-    props = compile_columns(client, core_columns=CORE_NEURON_COLS)
-    props = map(cypher_identifier, props)
+
+    # figure out which columns to return
+    if returned_columns == 'all':
+        props = compile_columns(client, core_columns=CORE_NEURON_COLS)
+    elif returned_columns == 'core':
+        props = compile_columns(client, core_columns=CORE_NEURON_COLS, core_columns_only=True)
+    elif isinstance(returned_columns, Iterable):
+        props = compile_columns(client, user_columns=returned_columns, core_columns=CORE_NEURON_COLS)
+    else:
+        raise ValueError(f'returned_columns must be a list or "all" or "core"; got {returned_columns}')
+
+    props = list(map(cypher_identifier, props))
+    if not props:
+        raise ValueError("No requested returned_columns exist!")
+
+    # 'roiInfo' must be present if the user doesn't specify omit_rois=True (even if they
+    #   didn't list it in returned_columns) but must be absent for omit_rois=False
+    if omit_rois:
+        if "roiInfo" in props:
+            props.remove("roiInfo")
+    else:
+        if 'roiInfo' not in props:
+            props.append('roiInfo')
+
     return_exprs = ',\n'.join(f'n.{prop} as {prop}' for prop in props)
     return_exprs = indent(return_exprs, ' '*15)[15:]
 
@@ -130,8 +165,12 @@ def fetch_neurons(criteria=None, *, client=None):
         ORDER BY n.bodyId
     """
     neuron_df = client.fetch_custom(q)
-    neuron_df, roi_counts_df = _process_neuron_df(neuron_df, client)
-    return neuron_df, roi_counts_df
+    neuron_df, roi_counts_df = _process_neuron_df(neuron_df, client, omit_rois)
+
+    if omit_rois:
+        return neuron_df
+    else:
+        return neuron_df, roi_counts_df
 
 
 @inject_client
@@ -196,15 +235,20 @@ def fetch_custom_neurons(q, *, client=None):
 
     neuron_df = pd.DataFrame(results['n'].tolist())
 
-    neuron_df, roi_counts_df = _process_neuron_df(neuron_df, client)
+    # note while fixing issue #69: unlike fetch_neurons(), this function doesn't
+    #    expose `omit_rois` as an argument; pass it explicitly here, but in the
+    #    future we could let the user specify
+    neuron_df, roi_counts_df = _process_neuron_df(neuron_df, client, omit_rois=False)
     return neuron_df, roi_counts_df
 
 
-def _process_neuron_df(neuron_df, client, parse_locs=True):
+def _process_neuron_df(neuron_df, client, omit_rois=False, parse_locs=True):
     """
-    Given a DataFrame of neuron properties, parse the roiInfo into
-    inputRois and outputRois, and a secondary DataFrame for per-ROI
-    synapse counts.
+    Given a DataFrame of neuron properties, order columns, parse coordinates,
+    and remove unwanted RoI columns.
+
+    Optionally parse the roiInfo into inputRois and outputRois,
+    and a secondary DataFrame for per-ROI synapse counts.
 
     Returns:
         neuron_df, roi_counts_df
@@ -222,11 +266,6 @@ def _process_neuron_df(neuron_df, client, parse_locs=True):
     neuron_cols += [*extra_cols]
     neuron_df = neuron_df[[*neuron_cols]]
 
-    # Make a list of rois for every neuron (both pre and post)
-    neuron_df['roiInfo'] = neuron_df['roiInfo'].apply(ujson.loads)
-    neuron_df['inputRois'] = neuron_df['roiInfo'].apply(lambda d: sorted([k for k,v in d.items() if v.get('post')]))
-    neuron_df['outputRois'] = neuron_df['roiInfo'].apply(lambda d: sorted([k for k,v in d.items() if v.get('pre')]))
-
     # Find location columns
     if parse_locs:
         for c in neuron_df.columns:
@@ -238,6 +277,30 @@ def _process_neuron_df(neuron_df, client, parse_locs=True):
                 continue
             neuron_df.loc[is_dict, c] = neuron_df.loc[is_dict, c].apply(lambda x: x.get('coordinates', x))
 
+    if not omit_rois:
+        roi_counts_df = _process_roi_info(neuron_df, client)
+    else:
+        roi_counts_df = None
+
+    return neuron_df, roi_counts_df
+
+
+def _process_roi_info(neuron_df, client):
+    """
+    Given a DataFrame of neuron properties, parse the roiInfo
+    into inputRois and outputRois, and a secondary DataFrame
+    for per-ROI synapse counts.
+
+    Returns:
+        roi_counts_df
+
+    Warning: destructively modifies the input DataFrame.
+    """
+
+    # Make a list of rois for every neuron (both pre and post)
+    neuron_df['roiInfo'] = neuron_df['roiInfo'].apply(ujson.loads)
+    neuron_df['inputRois'] = neuron_df['roiInfo'].apply(lambda d: sorted([k for k, v in d.items() if v.get('post')]))
+    neuron_df['outputRois'] = neuron_df['roiInfo'].apply(lambda d: sorted([k for k, v in d.items() if v.get('pre')]))
     # Return roi info as a separate table.
     # (Note: Some columns aren't present in old neuprint databases.)
     countcols = ['pre', 'post', 'downstream', 'upstream', 'mito']
@@ -270,4 +333,4 @@ def _process_neuron_df(neuron_df, client, parse_locs=True):
     # Drop the rows with all-zero counts (introduced via the NotPrimary rows we added)
     roi_counts_df = roi_counts_df.loc[roi_counts_df[countcols].any(axis=1)].copy()
 
-    return neuron_df, roi_counts_df
+    return roi_counts_df

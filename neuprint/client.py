@@ -59,8 +59,10 @@ import collections
 from textwrap import dedent, indent
 
 import pandas as pd
+import pyarrow as pa
 
 from functools import lru_cache
+from packaging import version
 
 import urllib3
 from urllib3.util.retry import Retry
@@ -74,14 +76,27 @@ import ujson
 
 logger = logging.getLogger(__name__)
 
-# These hold weak references
-DEFAULT_NEUPRINT_CLIENT = lambda: None
-USER_NEUPRINT_CLIENTS = set()
+# Weak-reference-based tracking of all live Client instances.
+#
+# We track by id() (identity) rather than equality because weakref.ref
+# delegates __eq__/__hash__ to the referent, which causes equal-but-distinct
+# Client objects to shadow each other in a set.  Using id() as dict keys
+# ensures every distinct object is tracked independently.
+#
+# _default_client_ref: weakref to the current default Client (or a
+#     lambda returning None when no default is set).
+# _user_clients: maps id(client) -> weakref.ref(client) for every live Client.
+# _thread_copies: maps (thread_id, pid) -> deepcopy of the default client,
+#     so each thread gets its own requests.Session (not thread-safe).
+# _suppress_registration: thread-local flag to prevent internal deepcopies
+#     (made for thread safety) from registering themselves as user clients.
 
-# This holds real references
-DEFAULT_NEUPRINT_CLIENT_THREAD_COPIES = {}
+_default_client_ref = lambda: None
+_user_clients = {}
+_thread_copies = {}
 
-_global_client_lock = threading.Lock()
+_lock = threading.RLock()
+_suppress_registration = threading.local()
 
 
 class NeuprintTimeoutError(HTTPError):
@@ -98,35 +113,32 @@ def default_client():
     It is automatically called by all query functions if
     you haven't passed in an explict `client` argument.
     """
-    with _global_client_lock:
-        default = DEFAULT_NEUPRINT_CLIENT()
+    with _lock:
+        default = _default_client_ref()
+
         if default is None:
-            clients = {c() for c in USER_NEUPRINT_CLIENTS if c()}
-            if len(clients) == 0:
+            live = _live_clients()
+            if len(live) == 0:
                 raise RuntimeError(
                     "No default Client has been set yet because you haven't yet created a Client.\n"
                 )
-            if len(clients) > 1:
+            if len(live) > 1 and not _all_equivalent(live):
                 raise RuntimeError(
                     "Currently more than one Client exists, so neither was automatically chosen as the default.\n"
                     "You must explicitly pass a client to query functions, or explicitly call set_default_client().\n"
-                    f"Currently {len(clients)} clients exist: {clients}"
-            )
-            if len(clients) == 1:
-                raise RuntimeError(
-                    "No default Client has been set. One client does exist already, "
-                    "which can be made the default via set_default_client()."
+                    f"Currently {len(live)} clients exist: {live}"
                 )
+            # One client, or multiple equivalent clients: re-establish a default.
+            _set_default_inner(live[0])
+            default = live[0]
 
-        thread_id = threading.current_thread().ident
-        pid = os.getpid()
-
+        thread_key = (threading.current_thread().ident, os.getpid())
         try:
-            c = DEFAULT_NEUPRINT_CLIENT_THREAD_COPIES[(thread_id, pid)]
+            return _thread_copies[thread_key]
         except KeyError:
-            c = copy.deepcopy(default)
-            DEFAULT_NEUPRINT_CLIENT_THREAD_COPIES[(thread_id, pid)] = c
-        return c
+            c = _deepcopy_no_register(default)
+            _thread_copies[thread_key] = c
+            return c
 
 
 def set_default_client(client):
@@ -141,44 +153,32 @@ def set_default_client(client):
     if client is None:
         clear_default_client()
         return
-
-    global DEFAULT_NEUPRINT_CLIENT  # noqa
-
-    thread_id = threading.current_thread().ident
-    pid = os.getpid()
-
-    with _global_client_lock:
-        DEFAULT_NEUPRINT_CLIENT = weakref.ref(client)
-        DEFAULT_NEUPRINT_CLIENT_THREAD_COPIES.clear()
-
-        # We exclusively store *copies* in this dict,
-        # to ensure that the DEFAULT_NEUPRINT_CLIENT weakref becomes
-        # invalid if the user deletes their Client.
-        DEFAULT_NEUPRINT_CLIENT_THREAD_COPIES[(thread_id, pid)] = copy.deepcopy(client)
+    with _lock:
+        _set_default_inner(client)
 
 
 def clear_default_client():
     """
     Unset the default Client, leaving no default in place.
     """
-    global DEFAULT_NEUPRINT_CLIENT  # noqa
-    with _global_client_lock:
-        DEFAULT_NEUPRINT_CLIENT = lambda: None  # noqa
-        DEFAULT_NEUPRINT_CLIENT_THREAD_COPIES.clear()
+    global _default_client_ref
+    with _lock:
+        _default_client_ref = lambda: None
+        _thread_copies.clear()
 
 
 def list_all_clients():
     """
     List all ``Client`` objects in the program.
     """
-    return {c() for c in USER_NEUPRINT_CLIENTS if c()}
+    return set(_live_clients())
 
 
 def _register_client(client):
     """
     Register the client in our global list of client weakrefs,
     and also set it as the default client if it happens to be the
-    ONLY client in existence.
+    ONLY client in existence (or all existing clients are equivalent).
 
     We use weak references instead of regular references to leave
     the user in control of which clients "still exist".
@@ -190,30 +190,71 @@ def _register_client(client):
             c = Client('neuprint.janelia.org', 'hemibrain:v1.2.1')
             n1, w1 = fetch_neurons(..., client=None)
 
-            c = Client('neprint.janelia.org', 'manc:v1.0')
+            c = Client('neuprint.janelia.org', 'manc:v1.0')
             n2, w2 = fetch_neurons(..., client=None)
 
     And since the first Client is deallocated, the second one
     becomes the default without issues.
     """
-    # Set this as the default client if this is the ONLY Client in existence.
-    with _global_client_lock:
-        clients = copy.copy(USER_NEUPRINT_CLIENTS)
-        # Housekeeping: drop invalid references
-        clients = {c for c in clients if c()}
-        clients.add(weakref.ref(client))
-        USER_NEUPRINT_CLIENTS.clear()
-        USER_NEUPRINT_CLIENTS.update(clients)
+    # Internal deepcopies (for thread safety) must not be tracked as user clients.
+    if getattr(_suppress_registration, 'active', False):
+        return
 
-    # If there weren't any other clients,
-    # then the new one becomes the default.
-    if len(clients) == 1:
-        set_default_client(client)
-    else:
-        # Otherwise, the default is cleared.
-        # If the user really wants to pick a default client,
-        # they can call set_default_client() explicitly.
-        clear_default_client()
+    with _lock:
+        cid = id(client)
+        if cid in _user_clients and _user_clients[cid]() is not None:
+            return  # same object already registered
+
+        def _cleanup(ref, cid=cid):
+            _user_clients.pop(cid, None)
+
+        _user_clients[cid] = weakref.ref(client, _cleanup)
+
+        live = _live_clients()
+        if len(live) == 1:
+            _set_default_inner(client)
+        elif _all_equivalent(live):
+            _set_default_inner(client)
+        else:
+            _clear_default_inner()
+
+
+# ---- internal helpers ----
+
+def _live_clients():
+    """Return a list of all live Client objects."""
+    return [ref() for ref in _user_clients.values() if ref() is not None]
+
+
+def _all_equivalent(clients):
+    """Return True if all clients in the list are equivalent (==)."""
+    return all(c == clients[0] for c in clients[1:])
+
+
+def _set_default_inner(client):
+    """Set the default client.  Caller must hold _lock."""
+    global _default_client_ref
+    _default_client_ref = weakref.ref(client)
+    _thread_copies.clear()
+
+    thread_key = (threading.current_thread().ident, os.getpid())
+    _thread_copies[thread_key] = _deepcopy_no_register(client)
+
+
+def _clear_default_inner():
+    """Clear the default client.  Caller must hold _lock."""
+    global _default_client_ref
+    _default_client_ref = lambda: None
+    _thread_copies.clear()
+
+
+def _deepcopy_no_register(client):
+    """Deepcopy a Client without triggering _register_client on the copy."""
+    _suppress_registration.active = True
+    try:
+        return copy.deepcopy(client)
+    finally:
+        _suppress_registration.active = False
 
 
 def inject_client(f):
@@ -364,7 +405,7 @@ class Client:
     """
     Client object for interacting with the neuprint database.
     """
-    def __init__(self, server, dataset=None, token=None, verify=True):
+    def __init__(self, server, dataset=None, token=None, verify=True, progress=True):
         """
         When you create the first ``Client``, it becomes the default
         ``Client`` to be used with all ``neuprint-python`` functions
@@ -390,7 +431,13 @@ class Client:
                 The dataset to run all queries against, e.g. 'hemibrain'.
                 If not provided, the server will use a default dataset for
                 all queries.
+
+            progress:
+                If ``True`` (default), show progress bars for long queries.
+
         """
+        self.progress = progress
+
         if not token:
             token = os.environ.get('NEUPRINT_APPLICATION_CREDENTIALS')
 
@@ -464,6 +511,7 @@ class Client:
 
     def __eq__(self, other):
         return (
+            other and
             self.server == other.server and  # noqa
             self.dataset == other.dataset and  # noqa
             self.token == other.token and  # noqa
@@ -472,6 +520,10 @@ class Client:
 
     def __hash__(self):
         return hash((self.server, self.dataset, self.token, self.verify))
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        _register_client(self)
 
     @verbose_errors
     def _fetch(self, url, json=None, ispost=False):
@@ -489,6 +541,14 @@ class Client:
     def _fetch_json(self, url, json=None, ispost=False):
         r = self._fetch(url, json=json, ispost=ispost)
         return ujson.loads(r.content)
+
+    def _fetch_arrow(self, url, json=None, ispost=False):
+        r = self._fetch(url, json=json, ispost=ispost)
+        content_type = r.headers.get('Content-Type', '')
+        if 'application/vnd.apache.arrow.stream' not in content_type:
+            raise Exception(f"Expected Arrow stream content type but got: {content_type}")
+        reader = pa.ipc.open_stream(pa.py_buffer(r.content))
+        return reader.read_all().to_pandas(maps_as_pydicts='strict')
 
     ##
     ## Cached properties
@@ -517,7 +577,7 @@ class Client:
     ## Note: Transaction queries are not implemented here.  See admin.py
     ##
 
-    def fetch_custom(self, cypher, dataset="", format='pandas'):  # noqa
+    def fetch_custom(self, cypher, dataset="", format='pandas', use_arrow=False):  # noqa
         """
         Query the neuprint server with a custom Cypher query.
 
@@ -536,18 +596,30 @@ class Client:
                 Whether to load the results into a ``pandas.DataFrame``,
                 or return the server's raw JSON response as a Python ``dict``.
 
-        Returns:
-            Either json or DataFrame, depending on ``format``.
-        """
-        url = f"{self.server}/api/custom/custom"
-        return self._fetch_cypher(url, cypher, dataset, format)
+            use_arrow:
+                Behind the scenes, fetch data from the server using Arrow IPC instead of JSON.
 
-    def _fetch_cypher(self, url, cypher, dataset, format='pandas'):  # noqa
-        """
-        Fetch cypher from an endpoint.
-        Called by fetch_custom and by Transaction queries.
+                If False, use JSON.
+                If True, use Arrow or raise an error if the server does not support it.
+                If None, use Arrow if the server supports it, otherwise use JSON.
+
+                Note:
+                    At the time of this writing, neuprintHTTP performs slightly worse with the
+                    Arrow IPC format than it does with JSON, which is why the default is JSON.
+
+        Returns:
+            json or DataFrame, depending on ``format``.
         """
         assert format in ('json', 'pandas')
+        assert use_arrow in (True, False, None)
+        dataset = dataset or self.dataset
+        server_handles_arrow = self.arrow_endpoint()
+
+        if format == 'json' and use_arrow:
+            raise RuntimeError("Returning JSON via Arrow is not supported.")
+
+        if use_arrow and not server_handles_arrow:
+            raise RuntimeError("Cannot use arrow: Server does not support Arrow IPC.")
 
         if set("‘’“”").intersection(cypher):
             msg = ("Your cypher query contains 'smart quotes' (e.g. ‘foo’ or “foo”),"
@@ -556,20 +628,27 @@ class Client:
                    "Your query was:\n" + cypher)
             raise RuntimeError(msg)
 
-        dataset = dataset or self.dataset
-
         cypher = indent(dedent(cypher), '    ')
         logger.debug(f"Performing cypher query against dataset '{dataset}':\n{cypher}")
 
-        result = self._fetch_json(url,
-                                  json={"cypher": cypher, "dataset": dataset},
-                                  ispost=True)
+        if format == 'pandas' and server_handles_arrow and use_arrow is not False:
+            return self._fetch_arrow(
+                f"{self.server}/api/custom/arrow",
+                {"cypher": cypher, "dataset": dataset},
+                True
+            )
+
+        response = self._fetch_json(
+            f"{self.server}/api/custom/custom",
+            {"cypher": cypher, "dataset": dataset},
+            True
+        )
 
         if format == 'json':
-            return result
+            return response
 
-        df = pd.DataFrame(result['data'], columns=result['columns'])
-        return df
+        return pd.DataFrame(response['data'], columns=response['columns'])
+
 
     ##
     ## API-META
@@ -596,8 +675,42 @@ class Client:
     def fetch_version(self):
         """
         Returns the version of the ``neuPrintHTTP`` server.
+
+        Returns:
+            str: The server version as a string.
+
+        Raises:
+            HTTPError: If the version endpoint is not found or returns an error.
+            KeyError: If the response doesn't contain a 'Version' key.
+            Exception: For other unexpected errors.
         """
-        return self._fetch_json(f"{self.server}/api/version")['Version']
+        try:
+            response = self._fetch_json(f"{self.server}/api/version")
+            return response['Version']
+        except (HTTPError, KeyError, Exception) as e:
+            # Let the caller handle the exception
+            raise
+
+    def arrow_endpoint(self):
+        """
+        Checks if the neuPrintHTTP server version supports Arrow IPC via HTTP.
+
+        Returns:
+            bool: True if the server version is 1.7.3 or higher, False otherwise.
+        """
+        try:
+            version_str = self.fetch_version()
+            if not version_str:
+                return False
+
+            # Parse semantic version
+            server_version = version.parse(version_str)
+            min_version = version.parse('1.7.3')
+
+            return server_version >= min_version
+        except (HTTPError, KeyError, Exception):
+            # If we can't determine the version for any reason, default to False
+            return False
 
     @lru_cache
     def fetch_neuron_keys(self):
@@ -620,6 +733,40 @@ class Client:
             neuron_props_json = ujson.loads(neuron_props_val)
             neuron_props = list(neuron_props_json.keys())
             return neuron_props
+
+    @lru_cache
+    def fetch_synapse_nt_keys(self):
+        """
+        Returns :Synapse properties related to neurotransmitters, sorted. Cached.
+
+        The properties may be stored in the :Meta node, or they may be
+        queried from the database directly.
+        """
+
+        # first, check the :Meta node; it'll have a dict of {property: property type}
+        b = "MATCH (n:Meta) RETURN n.ntSynapseProperties"
+        df_results = self.fetch_custom(b)
+        synapse_props_val = df_results.iloc[0, 0]
+        if synapse_props_val is not None:
+            synapse_props_json = ujson.loads(synapse_props_val)
+            synapse_props = list(synapse_props_json.keys())
+            return sorted(synapse_props)
+        else:
+            # fallback: query the database and see actually exists;
+            #   note all "pre" values have the same props
+            q = """
+                MATCH (s: Synapse {type:"pre"}) 
+                WITH [k IN keys(s) WHERE k STARTS WITH 'nt'] AS nt_keys
+                RETURN nt_keys
+                LIMIT 1
+                """
+            json_data = self.fetch_custom(q, format='json')
+            if json_data['data']:
+                return sorted(json_data['data'][0][0])
+            else:
+                logger.warning("No synapse neurotransmitter keys found in the database.")
+                return []
+
     ##
     ## DB-META
     ##

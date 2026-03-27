@@ -1,4 +1,3 @@
-import sys
 import copy
 from textwrap import dedent
 
@@ -14,7 +13,7 @@ from .connectivity import fetch_adjacencies
 
 @inject_client
 @neuroncriteria_args('neuron_criteria')
-def fetch_synapses(neuron_criteria, synapse_criteria=None, batch_size=10, nt=False, *, client=None):
+def fetch_synapses(neuron_criteria, synapse_criteria=None, batch_size=10, *, nt=None, client=None):
     """
     Fetch synapses from a neuron or selection of neurons.
 
@@ -43,8 +42,16 @@ def fetch_synapses(neuron_criteria, synapse_criteria=None, batch_size=10, nt=Fal
             will be fetched in batches, where each batch corresponds to N bodies.
             This argument sets the batch size N.
 
-        nt:
-            If True, add neurotransmitter predictions. Note that post-synapses have no preditions.
+        nt (None (default), 'max', or 'all'):
+            Optional. Retrieves neurotransmitter information for each "pre" synapse.
+
+            If None, no neurotransmitter information is retrieved.
+            If 'max', the most probable neurotransmitter for each synapse is returned in a column
+            named "nt" and a column "ntProb" indicating the probability associated with it.
+            If 'all', probabilities for all neurotransmitters are returned in named columns.
+
+            If no neurotransmitter information is available, then setting nt to 'max' or 'all'
+            will raise an error.
 
         client:
             If not provided, the global default :py:class:`.Client` will be used.
@@ -112,14 +119,12 @@ def fetch_synapses(neuron_criteria, synapse_criteria=None, batch_size=10, nt=Fal
     bodies = client.fetch_custom(q)['bodyId'].values
 
     batch_dfs = []
-    for batch_bodies in tqdm(iter_batches(bodies, batch_size)):
+    for batch_bodies in tqdm(iter_batches(bodies, batch_size), disable=not client.progress):
         batch_criteria = copy.copy(neuron_criteria)
         batch_criteria.bodyId = batch_bodies
-        if nt:
-            batch_df = _fetch_synapses_nt(batch_criteria, synapse_criteria, client)
-        else:
-            batch_df = _fetch_synapses(batch_criteria, synapse_criteria, client)
-        batch_dfs.append( batch_df )
+        batch_df = _fetch_synapses(batch_criteria, synapse_criteria, nt, client)
+        if len(batch_df) > 0:
+            batch_dfs.append( batch_df )
 
     if batch_dfs:
         return pd.concat( batch_dfs, ignore_index=True )
@@ -127,7 +132,7 @@ def fetch_synapses(neuron_criteria, synapse_criteria=None, batch_size=10, nt=Fal
     # Return empty results, but with correct dtypes
     dtypes = {'bodyId': np.dtype('int64'),
               'type': pd.CategoricalDtype(categories=['pre', 'post'], ordered=False),
-              'roi': np.dtype('O'),
+              'roi': pd.Series(['']).dtype,
               'x': np.dtype('int32'),
               'y': np.dtype('int32'),
               'z': np.dtype('int32'),
@@ -136,7 +141,7 @@ def fetch_synapses(neuron_criteria, synapse_criteria=None, batch_size=10, nt=Fal
     return pd.DataFrame([], columns=dtypes.keys()).astype(dtypes)
 
 
-def _fetch_synapses(neuron_criteria, synapse_criteria, client):
+def _fetch_synapses(neuron_criteria, synapse_criteria, nt, client):
     neuron_criteria.matchvar = 'n'
 
     if synapse_criteria is None:
@@ -153,6 +158,17 @@ def _fetch_synapses(neuron_criteria, synapse_criteria, client):
         neuron_criteria.rois = {*synapse_criteria.rois}
         neuron_criteria.roi_req = 'any'
 
+    # Neurotransmitters vary by dataset; get the names and dynamically
+    #   insert the column names into the cypher query.
+    synapse_nt_prop_names = []
+    if nt:
+        synapse_nt_prop_names = client.fetch_synapse_nt_keys()
+        if not synapse_nt_prop_names:
+            raise RuntimeError(
+                "Can't return synapse neurotransmitter properties: "
+                "No neurotransmitter properties found in the database."
+            )
+
     # Fetch results
     cypher = dedent(f"""\
         {neuron_criteria.global_with(prefix=8)}
@@ -165,7 +181,8 @@ def _fetch_synapses(neuron_criteria, synapse_criteria, client):
         {synapse_criteria.condition('n', 's', prefix=8)}
         // De-duplicate 's' because 'pre' synapses can appear in more than one SynapseSet
         WITH DISTINCT n, s
-
+        
+        // Extract properties as rows
         RETURN n.bodyId as bodyId,
                s.type as type,
                s.confidence as confidence,
@@ -174,105 +191,51 @@ def _fetch_synapses(neuron_criteria, synapse_criteria, client):
                s.location.z as z,
                apoc.map.removeKeys(s, ['location', 'confidence', 'type']) as syn_info
     """)
+
+    if nt and synapse_nt_prop_names:
+        cypher = cypher[:-1] + ',\n'
+        cypher += _neurotransmitter_return_clause(synapse_nt_prop_names, prefix=15)
+
     data = client.fetch_custom(cypher, format='json')['data']
 
     # Assemble DataFrame
     syn_table = []
-    for body, syn_type, conf, x, y, z, syn_info in data:
+    cleaned_nt_prop_names = [_clean_nt_name(name) for name in synapse_nt_prop_names]
+    for body, syn_type, conf, x, y, z, syn_info, *nt_probs in data:
+
+        nt_info = _process_nt_probabilities(nt, nt_probs, cleaned_nt_prop_names)
+
         # Exclude non-primary ROIs if necessary
         syn_rois = return_rois & {*syn_info.keys()}
         # Fixme: Filter for the user's ROIs (drop duplicates)
         for roi in syn_rois:
-            syn_table.append((body, syn_type, roi, x, y, z, conf))
+            syn_table.append((body, syn_type, roi, x, y, z, conf) + nt_info)
 
         if not syn_rois:
-            syn_table.append((body, syn_type, None, x, y, z, conf))
+            syn_table.append((body, syn_type, None, x, y, z, conf) + nt_info)
 
-    syn_df = pd.DataFrame(syn_table, columns=['bodyId', 'type', 'roi', 'x', 'y', 'z', 'confidence'])
+    synapse_columns = ['bodyId', 'type', 'roi', 'x', 'y', 'z', 'confidence']
+    if nt == "max":
+        synapse_columns.extend(['nt', 'ntProb'])
+    elif nt == "all":
+        synapse_columns.extend(cleaned_nt_prop_names)
+
+    syn_df = pd.DataFrame(syn_table, columns=synapse_columns)
 
     # Save RAM with smaller dtypes and interned strings
     syn_df['type'] = pd.Categorical(syn_df['type'], ['pre', 'post'])
-    syn_df['roi'] = syn_df['roi'].apply(lambda s: sys.intern(s) if s else s)
     syn_df['x'] = syn_df['x'].astype(np.int32)
     syn_df['y'] = syn_df['y'].astype(np.int32)
     syn_df['z'] = syn_df['z'].astype(np.int32)
     syn_df['confidence'] = syn_df['confidence'].astype(np.float32)
 
-    return syn_df
-
-
-def _fetch_synapses_nt(neuron_criteria, synapse_criteria, client):
-    neuron_criteria.matchvar = 'n'
-
-    if synapse_criteria is None:
-        synapse_criteria = SynapseCriteria()
-
-    if synapse_criteria.primary_only:
-        return_rois = {*client.primary_rois}
-    else:
-        return_rois = {*client.all_rois}
-
-    # If the user specified rois to filter synapses by, but hasn't specified rois
-    # in the NeuronCriteria, add them to the NeuronCriteria to speed up the query.
-    if synapse_criteria.rois and not neuron_criteria.rois:
-        neuron_criteria.rois = {*synapse_criteria.rois}
-        neuron_criteria.roi_req = 'any'
-
-    # Fetch results
-    cypher = dedent(f"""\
-        {neuron_criteria.global_with(prefix=8)}
-        MATCH (n:{neuron_criteria.label})
-        {neuron_criteria.all_conditions('n', prefix=8)}
-
-        MATCH (n)-[:Contains]->(ss:SynapseSet),
-              (ss)-[:Contains]->(s:Synapse)
-
-        {synapse_criteria.condition('n', 's', prefix=8)}
-        // De-duplicate 's' because 'pre' synapses can appear in more than one SynapseSet
-        WITH DISTINCT n, s
-
-        RETURN n.bodyId as bodyId,
-                s.type as type,
-                s.confidence as confidence,
-                s.location.x as x,
-                s.location.y as y,
-                s.location.z as z,
-                apoc.map.removeKeys(s, ['location', 'confidence', 'type']) as syn_info,
-                s.ntAcetylcholineProb as ntAcetylcholineProb,
-                s.ntGlutamateProb as ntGlutamateProb,
-                s.ntGabaProb as ntGabaProb,
-                s.ntHistamineProb as ntHistamineProb,
-                s.ntDopamineProb as ntDopamineProb,
-                s.ntOctopamineProb as ntOctopamineProb,
-                s.ntSerotoninProb as ntSerotoninProb
-    """)
-    data = client.fetch_custom(cypher, format='json')['data']
-
-    # Assemble DataFrame
-    syn_table = []
-    for body, syn_type, conf, x, y, z, syn_info, ntAch, ntGlu, ntGABA, ntHis, ntDop, ntOct, ntSer in data:
-        # Exclude non-primary ROIs if necessary
-        syn_rois = return_rois & {*syn_info.keys()}
-        # Fixme: Filter for the user's ROIs (drop duplicates)
-        for roi in syn_rois:
-            syn_table.append((body, syn_type, roi, x, y, z, conf, ntAch, ntGlu, ntGABA, ntHis, ntDop, ntOct, ntSer))
-
-        if not syn_rois:
-            syn_table.append((body, syn_type, None, x, y, z, conf, ntAch, ntGlu, ntGABA, ntHis, ntDop, ntOct, ntSer))
-
-    syn_df = pd.DataFrame(
-        syn_table,
-        columns=['bodyId', 'type', 'roi', 'x', 'y', 'z', 'confidence', 'ntAcetylcholineProb',
-                 'ntGlutamateProb', 'ntGabaProb', 'ntHistamineProb', 'ntDopamineProb',
-                 'ntOctopamineProb', 'ntSerotoninProb'])
-
-    # Save RAM with smaller dtypes and interned strings
-    syn_df['type'] = pd.Categorical(syn_df['type'], ['pre', 'post'])
-    syn_df['roi'] = syn_df['roi'].apply(lambda s: sys.intern(s) if s else s)
-    syn_df['x'] = syn_df['x'].astype(np.int32)
-    syn_df['y'] = syn_df['y'].astype(np.int32)
-    syn_df['z'] = syn_df['z'].astype(np.int32)
-    syn_df['confidence'] = syn_df['confidence'].astype(np.float32)
+    # nt columns types
+    if nt == 'all':
+        for column in cleaned_nt_prop_names:
+            syn_df[column] = syn_df[column].astype(np.float32)
+    elif nt == 'max':
+        syn_df['nt'] = pd.Categorical(syn_df['nt'], cleaned_nt_prop_names)
+        syn_df['ntProb'] = syn_df['ntProb'].astype(np.float32)
 
     return syn_df
 
@@ -354,7 +317,7 @@ def fetch_mean_synapses(neuron_criteria, synapse_criteria=None, batch_size=100, 
     bodies = client.fetch_custom(q)['bodyId'].values
 
     batch_dfs = []
-    for batch_bodies in tqdm(iter_batches(bodies, batch_size)):
+    for batch_bodies in tqdm(iter_batches(bodies, batch_size), disable=not client.progress):
         batch_criteria = copy.copy(neuron_criteria)
         batch_criteria.bodyId = batch_bodies
         if by_roi:
@@ -371,7 +334,7 @@ def fetch_mean_synapses(neuron_criteria, synapse_criteria=None, batch_size=100, 
     # Return empty results, but with correct dtypes
     dtypes = {'bodyId': np.dtype('int64'),
               'type': pd.CategoricalDtype(categories=['pre', 'post'], ordered=False),
-              'roi': np.dtype('O'),
+              'roi': pd.Series(['']).dtype,
               'count': np.dtype('int32'),
               'x': np.dtype('float32'),
               'y': np.dtype('float32'),
@@ -436,7 +399,6 @@ def _fetch_mean_synapses_per_roi(neuron_criteria, synapse_criteria, client):
 
     # Save RAM with smaller dtypes and interned strings
     syn_df['type'] = pd.Categorical(syn_df['type'], ['pre', 'post'])
-    syn_df['roi'] = syn_df['roi'].apply(lambda s: sys.intern(s) if s else s)
     syn_df['count'] = syn_df['count'].astype(np.int32)
     syn_df['x'] = syn_df['x'].astype(np.float32)
     syn_df['y'] = syn_df['y'].astype(np.float32)
@@ -493,7 +455,7 @@ def _fetch_mean_synapses_per_whole_neuron(neuron_criteria, synapse_criteria, cli
 
 @inject_client
 @neuroncriteria_args('source_criteria', 'target_criteria')
-def fetch_synapse_connections(source_criteria=None, target_criteria=None, synapse_criteria=None, min_total_weight=1, batch_size=10_000, *, client=None):
+def fetch_synapse_connections(source_criteria=None, target_criteria=None, synapse_criteria=None, min_total_weight=1, batch_size=10_000, *, nt=None, client=None):
     """
     Fetch synaptic-level connections between source and target neurons.
 
@@ -577,6 +539,17 @@ def fetch_synapse_connections(source_criteria=None, target_criteria=None, synaps
             Larger batches are more efficient to fetch, but increase the likelihood
             of timeouts.
 
+        neurotransmitters (None (default), 'max', or 'all'):
+            Optional. Retrieves neurotransmitter information for each "pre" synapse.
+
+            If None, no neurotransmitter information is retrieved.
+            If 'max', the most probable neurotransmitter for each presynapse is returned in a
+            column named "nt" along with a column "ntProb" indicating the probability associated with it.
+            If 'all', probabilities for all neurotransmitters are returned in named columns.
+
+            If no neurotransmitter information is available, then setting nt to 'max' or 'all'
+            will raise an error.
+
         client:
             If not provided, the global default :py:class:`.Client` will be used.
 
@@ -653,8 +626,8 @@ def fetch_synapse_connections(source_criteria=None, target_criteria=None, synaps
         dtypes = {
             'bodyId_pre': np.dtype('int64'),
             'bodyId_post': np.dtype('int64'),
-            'roi_pre': np.dtype('O'),
-            'roi_post': np.dtype('O'),
+            'roi_pre': pd.Series(['']).dtype,
+            'roi_post': pd.Series(['']).dtype,
             'x_pre': np.dtype('int32'),
             'y_pre': np.dtype('int32'),
             'z_pre': np.dtype('int32'),
@@ -679,10 +652,10 @@ def fetch_synapse_connections(source_criteria=None, target_criteria=None, synaps
         grouping_col = 'bodyId_post'
 
     syn_dfs = []
-    with tqdm(total=roi_conn_df['weight'].sum()) as progress:
+    with tqdm(total=roi_conn_df['weight'].sum(), disable=not client.progress) as progress:
         for _, group_df in conn_df.groupby(grouping_col):
             batches = iter_batches(group_df, batch_size)
-            for batch_df in tqdm(batches, leave=False):
+            for batch_df in tqdm(batches, leave=False, disable=not client.progress):
                 src_crit = copy.copy(source_criteria)
                 tgt_crit = copy.copy(target_criteria)
 
@@ -707,7 +680,8 @@ def fetch_synapse_connections(source_criteria=None, target_criteria=None, synaps
                                                            tgt_crit,
                                                            synapse_criteria,
                                                            min_total_weight,
-                                                           client )
+                                                           nt=nt,
+                                                           client=client)
                 if len(batch_syn_df) > 0:
                     syn_dfs.append(batch_syn_df)
                 progress.update(len(batch_syn_df))
@@ -719,7 +693,7 @@ def fetch_synapse_connections(source_criteria=None, target_criteria=None, synaps
     return syn_df
 
 
-def _fetch_synapse_connections(source_criteria, target_criteria, synapse_criteria, min_total_weight, client):
+def _fetch_synapse_connections(source_criteria, target_criteria, synapse_criteria, min_total_weight, nt, client):
     if synapse_criteria.primary_only:
         return_rois = {*client.primary_rois}
     else:
@@ -748,6 +722,17 @@ def _fetch_synapse_connections(source_criteria, target_criteria, synapse_criteri
         [source_criteria, target_criteria],
         ['n', 'e', 'm', 'ns', 'ms', *criteria_globals],
         prefix=8)
+
+    # Neurotransmitters vary by dataset; get the names and dynamically
+    #   insert the column names into the cypher query.
+    synapse_nt_prop_names = []
+    if nt:
+        synapse_nt_prop_names = client.fetch_synapse_nt_keys()
+        if not synapse_nt_prop_names:
+            raise RuntimeError(
+                "Can't return synapse neurotransmitter properties: "
+                "No neurotransmitter properties found in the database."
+            )
 
     # Fetch results
     cypher = dedent(f"""\
@@ -779,18 +764,27 @@ def _fetch_synapse_connections(source_criteria, target_criteria, synapse_criteri
                apoc.map.removeKeys(ns, ['location', 'confidence', 'type']) as info_pre,
                apoc.map.removeKeys(ms, ['location', 'confidence', 'type']) as info_post
     """)
+
+    if nt and synapse_nt_prop_names:
+        cypher = cypher[:-1] + ',\n'
+        cypher += _neurotransmitter_return_clause(synapse_nt_prop_names, prefix=15, matchvar='ns')
+
     data = client.fetch_custom(cypher, format='json')['data']
 
     # Assemble DataFrame
     syn_table = []
-    for bodyId_pre, bodyId_post, ux, uy, uz, dx, dy, dz, up_conf, dn_conf, info_pre, info_post in data:
+    cleaned_nt_prop_names = [_clean_nt_name(name) for name in synapse_nt_prop_names]
+    for bodyId_pre, bodyId_post, ux, uy, uz, dx, dy, dz, up_conf, dn_conf, info_pre, info_post, *nt_probs in data:
+
+        nt_info = _process_nt_probabilities(nt, nt_probs, cleaned_nt_prop_names)
+
         # Exclude non-primary ROIs if necessary
         pre_rois = return_rois & {*info_pre.keys()}
         post_rois = return_rois & {*info_post.keys()}
 
         # Intern the ROIs to save RAM
-        pre_rois = sorted(map(sys.intern, pre_rois))
-        post_rois = sorted(map(sys.intern, post_rois))
+        pre_rois = sorted(pre_rois)
+        post_rois = sorted(post_rois)
 
         pre_rois = pre_rois or [None]
         post_rois = post_rois or [None]
@@ -801,12 +795,16 @@ def _fetch_synapse_connections(source_criteria, target_criteria, synapse_criteri
             pre_rois = pre_rois[0]
             post_rois = post_rois[0]
 
-        syn_table.append((bodyId_pre, bodyId_post, pre_rois, post_rois, ux, uy, uz, dx, dy, dz, up_conf, dn_conf))
+        syn_table.append((bodyId_pre, bodyId_post, pre_rois, post_rois, ux, uy, uz, dx, dy, dz, up_conf, dn_conf) + nt_info)
 
-    syn_df = pd.DataFrame(syn_table, columns=['bodyId_pre', 'bodyId_post',
-                                              'roi_pre', 'roi_post',
-                                              'x_pre', 'y_pre', 'z_pre', 'x_post', 'y_post', 'z_post',
-                                              'confidence_pre', 'confidence_post'])
+    synapse_columns = ['bodyId_pre', 'bodyId_post', 'roi_pre', 'roi_post',
+        'x_pre', 'y_pre', 'z_pre', 'x_post', 'y_post', 'z_post', 'confidence_pre', 'confidence_post']
+    if nt == "max":
+        synapse_columns.extend(['nt', 'ntProb'])
+    elif nt == "all":
+        synapse_columns.extend(cleaned_nt_prop_names)
+
+    syn_df = pd.DataFrame(syn_table, columns=synapse_columns)
 
     syn_df['bodyId_pre'] = syn_df['bodyId_pre'].astype(np.int64)
     syn_df['bodyId_post'] = syn_df['bodyId_post'].astype(np.int64)
@@ -821,4 +819,75 @@ def _fetch_synapse_connections(source_criteria, target_criteria, synapse_criteri
     syn_df['confidence_pre'] = syn_df['confidence_pre'].astype(np.float32)
     syn_df['confidence_post'] = syn_df['confidence_post'].astype(np.float32)
 
+    # nt columns types
+    if nt == 'all':
+        for column in cleaned_nt_prop_names:
+            syn_df[column] = syn_df[column].astype(np.float32)
+    elif nt == 'max':
+        syn_df['nt'] = pd.Categorical(syn_df['nt'], cleaned_nt_prop_names)
+        syn_df['ntProb'] = syn_df['ntProb'].astype(np.float32)
+
     return syn_df
+
+# a few common routines used when working with neurotransmitter info
+
+def _clean_nt_name(name):
+    """
+    given a neurotransmitter probability name as stored in the database,
+    return the name without the 'nt' and 'Prob' parts, lowercase
+    """
+    return name.replace('nt', '').replace('Prob', '').lower()
+
+def _max_nt(nt_prop_names, nt_probs):
+    """
+    Return the name of the neurotransmitter with the highest
+    probability and the corresponding probability value.
+
+    input: list of nt property names and list of probabilities, in the same order
+    """
+
+    # if any probs are None, they all are
+    if not nt_probs or nt_probs[0] is None:
+        return (None, np.nan)
+
+    max_prob = max(nt_probs)
+    nt_name = nt_prop_names[nt_probs.index(max_prob)]
+    return (nt_name, max_prob)
+
+def _neurotransmitter_return_clause(synapse_nt_prop_names, prefix="", matchvar='s'):
+    """
+    Returns the section of the RETURN clause of the cypher query for
+    all the neurotransmitter probabilities.
+
+    input: list of the property names; a prefix to indent the query (if integer,
+        that many spaces); and the match variable to use
+    """
+    if isinstance(prefix, int):
+        prefix = ' ' * prefix
+    if synapse_nt_prop_names:
+        return ",\n".join(f"{prefix}{matchvar}.{name} as {name}" for name in synapse_nt_prop_names)
+    else:
+        return ""
+
+
+def _process_nt_probabilities(nt, nt_probs, cleaned_nt_prop_names):
+    """
+    Process neurotransmitter probabilities based on the requested type.
+
+    Args:
+        nt: 'max', 'all', or None.
+        nt_probs: List of neurotransmitter probabilities.
+        cleaned_nt_prop_names: List of cleaned neurotransmitter names.
+
+    Returns:
+        Processed neurotransmitter information.
+    """
+    match nt:
+        case None:
+            return ()
+        case 'max':
+            return _max_nt(cleaned_nt_prop_names, nt_probs)
+        case 'all':
+            return tuple(nt_probs)
+        case _:
+            raise ValueError(f"Invalid option for nt: {nt}. Use None, 'max', or 'all'.")

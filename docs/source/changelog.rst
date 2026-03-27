@@ -1,6 +1,36 @@
 Changelog
 =========
 
+0.6.1 / 2026-03-19
+------------------
+- Fixed syntax compatibility with Python 3.10/3.11 (PR #107)
+
+0.6 / 2026-03-05
+------------------
+- Fixed a cypher quoting issue that could occur in certain time-boxed queries such as in ``fetch_paths()`` (PR #103)
+- Fixed a bug in how clients are tracked and managed for the purpose of selecting a default client. (PR #104)
+- Fix misc. issues with pandas 3 compatibility. (PR #105)
+
+0.5.2 / 2025-08-24
+------------------
+- Optionally fetch data from the server via ArrowIPC instead of JSON.  Disabled by default. (PR # 71)
+- Fixed docs search (PR #86)
+- Added more fields to ``NeuronCriteria`` to support various datasets. (PR #88, PR #91)
+    - The new type fields ``flywireType``, ``mancType`` and ``hemibrainType`` can be matched via regular expressions. (PR #84)
+- Fix the way coordinate values (e.g. ``somaLocation``) are returned from ``fetch_neurons(omit_rois=True)`` (PR #72)
+- Fixed string handling when searching for properties whose values contain quote characters (PR #96)
+- Fixed an issue that prevented clients from being used in multiprocessing pools (PR #95)
+- Optionally disable all progress bars via ``Client(..., progress=False)`` (PR #98)
+- Added ``fetch_paths()``, a more general path search function than ``fetch_shortest_paths()`` (PR #79)
+- More convenient handling of the way clients are passed in to functions and ``NeuronCriteria`` (PR #87)
+- Added ``returned_columns`` parameter to ``fetch_neurons()`` (PR #90)
+- Optionally return synapse-level neurotransmitter probabilities in ``fetch_synapses()`` and ``fetch_synapse_connections()`` (PR #78)
+
+0.5.1 / 2025-02-02
+------------------
+- ``fetch_neurons()``: Added ``omit_rois`` option, which speeds up the function if you don't need ROI information.
+- For admins: Fixed an issue that could cause needless exceptions to be raised when cleaning up from a failed transaction.
+
 0.5 / 2024-12-11
 ----------------
 - Now compatible with numpy 2.x
@@ -10,7 +40,7 @@ Changelog
   This is crucial if multiple clients have been constructed.
 - ``fetch_mean_synapses()``: Added ``by_roi`` option to allow the user to fetch whole-neuron mean synapses
 - ``fetch_shorted_paths()`` allows you to omit filtering entirely using ``NC()``
-- ``fetch_neurons()``: If no ``NeuronCriteria`` is provided, fetch all ``:Neuron``s by default
+- ``fetch_neurons()``: If no ``NeuronCriteria`` is provided, fetch all ``:Neuron``\s by default
 - Added ``available_datasets`` to utils.py (PR #60)
 - Internally generated Cypher now uses backticks for variables/properties that require them. (PR #42 and related commits)
 - Bug fix in ``connection_table_to_matrix()`` (PR #47)
